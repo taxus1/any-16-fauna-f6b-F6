@@ -187,6 +187,7 @@ PO↔领域↔VO 三层分离，DB 调用统一走仓储适配器的 `blocking(.
 | 巡护任务 | `/api/tasks` | `POST` 派发（编号 `PT-YYYY-NNNN` 自动生成，也可显式指定，撞号返回业务失败不甩底层错；默认待执行）、`GET /{id}` 详情、`PUT /{id}` 改任务、`POST /{id}/start` 开工、`POST /{id}/complete` 完成回报、`POST /{id}/cancel` 取消（置已取消并逻辑销账：名单翻不到、账留在表里）、`GET` 条件分页（stationId/siteId/patrolType/status/plannedDate 全空翻整份任务，每行带任务编号） |
 | 野生动物观测 | `/api/obs` | `POST` 录入（编号 `WO-YYYY-NNNNNN` 自动生成，6 位序号，撞号重试不甩底层错；任务必须正在执行、物种必须在名录且启用、个体数量必须为正数、健康状态默认 NORMAL；照名录当前保护级别抄一份快照）、`GET /{id}` 详情、`PUT /{id}` 改录（点位/物种/数量/健康状态/观测时刻/记录人，任务归属不改；换物种重抄快照）、`POST /{id}/void` 作废（逻辑删除：清单翻不到、底子留在库）、`GET` 条件分页（taskId/siteId/speciesCode/healthStatus/观测时刻区间随意拼，每行带观测编号） |
 | 异常个体上报 | `/api/reports` | `POST` 登记（编号 `AR-YYYY-NNNN` 自动生成，撞号重试不甩底层错；只有健康状态非正常的在册观测报得了，类别须与观测健康状态对口：伤报 INJURED、死报 DEAD、疑似疫病报 SUSPECT_DISEASE；严重程度系统算不用前端填：死亡/疑似疫病一律 HIGH，受伤的看观测保护级别快照，国家一级/二级算 HIGH、其余 MEDIUM）、`GET /{id}` 详情、`POST /{id}/advance` 处置推进（REPORTED→HANDLING→RESCUED/SAMPLED→CLOSED，只顺不逆、不跳级，结案为终态，推进记下处置时刻）、`POST /{id}/void` 作废（逻辑删除：名单翻不到、账留在库，作废后该观测可重报）、`GET` 条件分页（siteId/category/severity/status 随意拼，每行带上报编号） |
+| 疫病预警 | `/api/alerts` | 无新建入口：样本检测结果一录成 POSITIVE，预警在结果回填同一事务里自动生成（阴性/不确定不立；同一份阳性样本只落一条，样本行锁串行化 + 按 sample_id 计数兜底，前后脚递两回也只一条，不甩底层错；编号 `AL-YYYY-NNNN` 自动生成）；级别在上报严重程度基准档（MEDIUM→黄、HIGH→橙）之上再叠观测保护级别快照（一般 +0、省级 +1、国家二级 +2、国家一级 +3，封顶红），快照取观测行不跟名录后改；`GET /{id}` 详情、`POST /{id}/advance` 处置推进（RAISED→HANDLING→RESOLVED→CLOSED，只顺不逆、不跳级，归档终态再推挡回；发布/解除各记时刻，解除时刻不得早于发布，处置中/归档时刻走审计列 update_time；推到解除时挂的上报若未结案一并推到 CLOSED，已结案的照旧）、`GET` 条件分页（reportId/sampleId/alertLevel/status 随意拼，每行带预警编号） |
 
 约定：
 - 编号生成「取号→落库」一体化重试（`BizNoGenerator`）：并发撞号重新取号，唯一索引兜底，
@@ -217,6 +218,23 @@ PO↔领域↔VO 三层分离，DB 调用统一走仓储适配器的 `blocking(.
   处置时刻记在审计列 update_time（表按现状用，无 handled_at 列），VO 以 handledAt 回出。
 - 上报作废是逻辑删除（del_flag=1）：分页与详情不再翻到，账留在 t_abnormal_report 备查，
   作废占用的编号不复用（取号 SQL 不拼 del_flag）。
+- 疫病预警不用人另外去点：检测结果回填事务里样本按 result=PENDING 条件更新翻成阳性后，
+  同一事务把预警一起落（阴性/不确定不立）；该条件更新已在样本行上把并发回填串行化，
+  再 `SELECT COUNT(*) ... WHERE sample_id=?` 兜一道 —— 同一份阳性样本前后脚递两回也只落一条，
+  后到者整体回滚报业务失败，不甩底层 DuplicateKeyException。
+- 预警级别不另造口径：以上上报判死的严重程度为基准档（MEDIUM→黄、HIGH→橙），
+  再叠观测上抄的那份保护级别快照（一般 +0、省级 +1、国家二级 +2、国家一级 +3，只抬不压、封顶红）；
+  快照用 `SELECT protection_level FROM t_wildlife_obs WHERE id=?`（不拼 del_flag）取观测行上的值，
+  既不跟名录后来的级别改动跑，观测事后作废也取得到当初那份。
+- 预警处置单向流转：RAISED→HANDLING→RESOLVED→CLOSED，只能顺着走、不能跳级不能回退，
+  归档是终态再推挡回；推进走「按原状态条件更新」，并发推同一单只有一下翻得动。
+  raised_at 立单时记、resolved_at 解除时记（不得早于 raised_at，领域拦），
+  处置中/归档无专列时刻，记在审计列 update_time（VO 以 handledAt 回出）。
+- 解除顺手收尾上报：同一事务里把挂的那条上报按 `status != CLOSED` 条件更新推到已结案 ——
+  还没结案的跟着结，已结案的 0 行照旧；已作废（del_flag=1）的不被波及。
+- 已在真实 MySQL 上端到端验证：自动生成、四档级别叠加（受伤/死亡/疑似疫病 × 一般/省级/国家二级/
+  国家一级）、状态机只顺不逆、解除时刻校验与上报随解结案、上报已结案解除照旧、条件分页，
+  以及 8 路并发阳性回填只有一路成功且只落一条预警，全部通过。
 - 已在真实 MySQL 上端到端验证：69 项空库全流程用例 + 13 项存量数据（any_16_fauna 种子库）用例全部通过，
   含 10 路并发建站、8 路并发建点的编号唯一性验证。
 

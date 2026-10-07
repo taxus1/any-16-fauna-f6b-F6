@@ -5,12 +5,15 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.github.pagehelper.PageHelper;
 import com.somepro.common.exception.BizException;
+import com.somepro.domain.alert.model.EpiAlert;
 import com.somepro.domain.report.model.AbnormalReport;
 import com.somepro.domain.sample.model.SampleTest;
 import com.somepro.domain.sample.repository.SampleTestRepository;
 import com.somepro.domain.shared.model.PageResult;
 import com.somepro.infrastructure.config.ReactiveOperatorContext;
+import com.somepro.infrastructure.persistence.alert.EpiAlertRepositoryImpl;
 import com.somepro.infrastructure.persistence.audit.AuditContextHolder;
+import com.somepro.infrastructure.persistence.obs.WildlifeObsMapper;
 import com.somepro.infrastructure.persistence.report.AbnormalReportMapper;
 import com.somepro.infrastructure.persistence.report.po.AbnormalReportPO;
 import com.somepro.infrastructure.persistence.sample.converter.SampleTestPoConverter;
@@ -39,6 +42,11 @@ import java.util.stream.Collectors;
  * （已上报/处置中）条件更新推到已采样；上报已不在在办的 —— 已采样是幂等放行
  * （同一份上报前一条样本录结果时推过），已救护/已结案/已作废则整体回滚报错，
  * 样本那行也不落。
+ *
+ * 阳性还多生一头：结果一录成阳性，预警不用人另外去点，同一事务里跟着立一条 ——
+ * 级别在上报严重程度之上叠观测上的保护级别快照；样本那行的条件更新已把并发回填
+ * 串行化（后到者在样本行锁上排队），再按 sample_id 数一道，同一份阳性样本前后脚
+ * 递两回也只落一条预警。阴性/不确定不立。
  */
 @Repository
 public class SampleTestRepositoryImpl implements SampleTestRepository {
@@ -48,13 +56,19 @@ public class SampleTestRepositoryImpl implements SampleTestRepository {
 
     private final SampleTestMapper sampleMapper;
     private final AbnormalReportMapper reportMapper;
+    private final WildlifeObsMapper obsMapper;
+    private final EpiAlertRepositoryImpl alertRepository;
     private final TransactionTemplate transactionTemplate;
 
     public SampleTestRepositoryImpl(SampleTestMapper sampleMapper,
                                     AbnormalReportMapper reportMapper,
+                                    WildlifeObsMapper obsMapper,
+                                    EpiAlertRepositoryImpl alertRepository,
                                     PlatformTransactionManager transactionManager) {
         this.sampleMapper = sampleMapper;
         this.reportMapper = reportMapper;
+        this.obsMapper = obsMapper;
+        this.alertRepository = alertRepository;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -108,6 +122,15 @@ public class SampleTestRepositoryImpl implements SampleTestRepository {
                 if (!AbnormalReport.STATUS_SAMPLED.equals(current.getStatus())) {
                     throw new BizException("上报已结案或已不走采样线，检测结果回填失败");
                 }
+            }
+            // 阳性预警：结果一录成阳性，预警不用人另外去点，同一事务里跟着立一条；
+            // 阴性/不确定不立。级别 = 上报严重程度之上叠观测上抄的保护级别快照（领域算）。
+            if (SampleTest.RESULT_POSITIVE.equals(sample.getResult())) {
+                AbnormalReportPO report = reportMapper.selectById(sample.getReportId());
+                String protectionLevel = obsMapper.selectProtectionLevelById(report.getObsId());
+                EpiAlert alert = EpiAlert.raise(report.getId(), sample.getId(),
+                        report.getSeverity(), protectionLevel, null);
+                alertRepository.doCreateAuto(alert);
             }
             return SampleTestPoConverter.toDomain(sampleMapper.selectById(sample.getId()));
         }));

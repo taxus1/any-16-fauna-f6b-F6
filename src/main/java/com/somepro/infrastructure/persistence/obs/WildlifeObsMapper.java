@@ -36,4 +36,14 @@ public interface WildlifeObsMapper extends BaseMapper<WildlifeObsPO> {
      */
     @Select("SELECT id FROM t_wildlife_obs WHERE id = #{id} FOR UPDATE")
     Long lockById(@Param("id") Long id);
+
+    /**
+     * 只取一条观测上抄下来的保护级别快照（预警定级用）。
+     *
+     * 自定义 @Select 不拼 del_flag：预警级别要的是阳性样本→上报→观测那条链上当初抄下的
+     * 那份快照，观测后来作废（del_flag=1）也得取得到；更不能转头去查物种名录的现行级别，
+     * 快照不跟名录后来的改动跑。
+     */
+    @Select("SELECT protection_level FROM t_wildlife_obs WHERE id = #{id}")
+    String selectProtectionLevelById(@Param("id") Long id);
 }
